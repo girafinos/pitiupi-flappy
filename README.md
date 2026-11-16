@@ -1,43 +1,112 @@
-# Plugin Flappy Bird P2P (`pitiupi.flappy`)
+# Flappy Bird P2P (`pitiupi.flappy`)
 
-Jogo multiplayer em tempo real no modelo **Ghost Race (Corrida de Fantasmas)** construído sobre o núcleo P2P do Pitiupi para práticas de **Redes de Computadores**.
+Plugin multiplayer em tempo real no estilo **Ghost Race** (*Packet Runner P2P*) desenvolvido como atividade prática da disciplina de **Redes de Computadores**, utilizando a arquitetura de plugins da plataforma **[Pitiupi](https://github.com/GabrielFSSantos/pitiupi)**.
 
----
-
-## 1. Conceitos de Redes Demonstrados
-
-1. **Sincronização Procedural por Semente Compartilhada (*Deterministic Seed*):**
-   - Em vez de trafegar coordenadas de todos os canos pela rede a cada quadro, o nó que inicia a partida transmite apenas uma semente inteira (`seed`, 64 bits) na mensagem `FlappyMatchMessage(SYNC_START)`.
-   - A altura da abertura de cada cano `i` é calculada por uma função pura determinística `getPipeGapCenterY(i, seed)`. Todos os nós na sala geram exatamente o mesmo circuito de obstáculos com **zero overhead de banda** para o cenário.
-
-2. **Telemetria em Tempo Real (~20 Hz) vs Renderização a 60 FPS (*Dead Reckoning*):**
-   - Durante o voo, cada jogador transmite pacotes `FlappyStateMessage` a ~20 Hz (a cada ~48 ms) contendo `(birdY, birdVelocityY, worldX, seqNum)`.
-   - Entre dois pacotes UDP consecutivos, o receptor extrapola localmente o movimento do fantasma a 60 FPS aplicando a velocidade vertical e gravidade (*Dead Reckoning*).
-   - O painel inclui a caixa **"Interpolação UDP (Dead Reckoning)"**, permitindo ligar/desligar a extrapolação ao vivo durante a apresentação para demonstrar visualmente a diferença entre pacotes brutos a 20 Hz e movimento interpolado a 60 FPS.
-
-3. **Controle de Sequência, Perda de Pacotes e Desordenação (`seqNum`):**
-   - Cada datagrama `FlappyStateMessage` carrega um número de sequência monotônico (`seqNum`).
-   - Se chegar um pacote atrasado (`seqNum <= lastSeqNum`), ele é contabilizado como **Fora de Ordem (OOO)** e descartado para o pássaro fantasma não "voltar no tempo".
-   - Se houver salto (`seqNum > lastSeqNum + 1`), a diferença é contabilizada como **Perda UDP** no painel de telemetria.
+> **Projeto base:** Este plugin depende do núcleo **[GabrielFSSantos/pitiupi](https://github.com/GabrielFSSantos/pitiupi)** e se integra a ele via `SPI` (`META-INF/services/pitiupi.models.Plugin`), sem modificações no código-fonte base do Pitiupi.
 
 ---
 
-## 2. Especificação do Protocolo de Aplicação
+## Sumário
 
-| Classe (`Message`) | Frequência | Campos Principais | Papel no Protocolo |
-| --- | --- | --- | --- |
-| `FlappyMatchMessage` | Eventos discretos | `action` (`SYNC_START`, `JOIN_ACK`, `GAME_OVER`), `matchId`, `seed`, `senderInstanceId`, `senderName`, `senderIp`, `finalScore` | Anuncia nova corrida sincronizada com semente compartilhada (contagem regressiva de 3s), confirma presença (`JOIN_ACK`) e informa pontuação final ao colidir (`GAME_OVER`). |
-| `FlappyStateMessage` | ~20 Hz em voo | `matchId`, `seed`, `senderInstanceId`, `seqNum`, `birdY`, `birdVelocityY`, `worldX`, `score`, `alive` | Atualiza posição cinemática do pássaro fantasma e alimenta as métricas de pacotes (TX, RX, Perdas e OOO). |
+- [Visão Geral e Conceitos de Redes](#visão-geral-e-conceitos-de-redes)
+- [Estrutura do Plugin](#estrutura-do-plugin)
+- [Protocolo de Aplicação](#protocolo-de-aplicação)
+- [Como Instalar e Compilar no Pitiupi](#como-instalar-e-compilar-no-pitiupi)
+- [Execução em Rede Local (Linux e Windows)](#execução-em-rede-local-linux-e-windows)
 
 ---
 
-## 3. Como Compilar e Executar
+## Visão Geral e Conceitos de Redes
 
-Na raiz do repositório `pitiupi`:
+1. **Comunicação 100% UDP (`PluginTransportCatalog.PluginKind.PING`):**
+   - **Aba `Todos ↑` (Sala Geral):** envia datagramas em **UDP Multicast (`224.0.0.3`)** para todos os peers inscritos no grupo.
+   - **Aba `+ Nova` (Peer por IPv4):** envia datagramas em **UDP Unicast** direto para o IP do colega, útil em redes Wi-Fi que bloqueiam tráfego multicast.
+   - O transporte **TCP** foi intencionalmente desabilitado no plugin para evitar *Head-of-Line Blocking* (travamentos causados por retransmissão de pacotes antigos) em tempo real.
 
+2. **Sincronização Procedural por Semente Compartilhada (`seed`):**
+   - Antes da largada, os jogadores compartilham apenas uma semente numérica (`long seed`) na mensagem `SYNC_START`.
+   - Cada máquina calcula localmente a abertura exata dos obstáculos usando a função determinística `getPipeGapCenterY(pipeIndex, seed)`, gerando o mesmo circuito com **zero overhead de banda** para o cenário.
+
+3. **Telemetria a 20 Hz vs. Renderização a 60 FPS (*Dead Reckoning*):**
+   - Em modo multiplayer, o plugin transmite a cinemática do jogador (`birdY`, `birdVelocityY`, `worldX`, `score`, `alive`) a ~**20 Hz** (a cada `48 ms`) em uma thread separada (`networkExecutor`), sem bloquear a EDT do Swing.
+   - Nos intervalos entre pacotes, o receptor extrapola a trajetória dos fantasmas a **60 FPS** utilizando gravidade e velocidade vertical (*Dead Reckoning*). A barra superior permite ligar/desligar a interpolação ao vivo.
+
+4. **Detecção de Perda (`LOSS`) e Pacotes Fora de Ordem (`OOO`):**
+   - Cada pacote `FlappyStateMessage` carrega um número de sequência (`seqNum`) em camada de aplicação.
+   - Em `GhostState.applyNetworkState`: saltos na sequência (`seqNum > lastSeqNum + 1`) são contabilizados como perda UDP; pacotes atrasados (`seqNum <= lastSeqNum`) são contabilizados como fora de ordem (`OOO`) e descartados.
+
+5. **Sala de Espera Sincronizada (`SYN-READY`) e Voo Local Offline:**
+   - Clicar em **Iniciar Corrida Sincronizada (Rede)** abre a tela de pronto exigindo quórum (`total / 2 + 1`, ou seja, todos prontos em dupla ou maioria em salas maiores) antes de o nó líder (menor `instanceId`) sortear a nova `seed` e disparar `SYNC_START` (com reenvio redundante de 80 ms em UDP).
+   - O botão **Voo Local (Solo)** mantém `localSoloMode = true` para testes individuais sem envio de pacotes nem renderização de fantasmas.
+
+---
+
+## Estrutura do Plugin
+
+```text
+plugins/flappy/
+├── build.xml
+├── nbproject/
+└── src/
+    ├── META-INF/services/pitiupi.models.Plugin   # Registro SPI do plugin
+    └── pitiupi/flappy/
+        ├── plugin/   # Porta de entrada no Pitiupi (FlappyPlugin)
+        ├── net/      # Protocolo de aplicação (FlappyAction, FlappyMatchMessage, FlappyStateMessage)
+        ├── control/  # Despacho de rede, quórum Ready, LOSS/OOO e Dead Reckoning
+        ├── GUI/      # Interface Swing, motor 2D a 60 FPS (VolatileImage), parallax e osciloscópio
+        └── assets/   # Sprites em pixel art (.png) feitos no Aseprite
+```
+
+---
+
+## Protocolo de Aplicação
+
+| Mensagem | Frequência | Conteúdo / Função |
+| --- | --- | --- |
+| `FlappyMatchMessage` | Eventos discretos | Controle de sessão via `FlappyAction`: `READY_STATE` (confirmação de pronto), `SYNC_START` (`matchId` + `seed`), `JOIN_ACK` e `GAME_OVER` (`finalScore`). |
+| `FlappyStateMessage` | ~20 Hz em voo | Datagrama de telemetria contendo `matchId`, `seed`, `seqNum`, `birdY`, `birdVelocityY`, `worldX`, `score` e `alive`. |
+
+---
+
+## Como Instalar e Compilar no Pitiupi
+
+1. Clone o repositório base do Pitiupi (**Java 17+ / 21** e **Apache Ant** instalados):
+   ```bash
+   git clone https://github.com/GabrielFSSantos/pitiupi.git
+   cd pitiupi
+   ```
+
+2. Copie a pasta `plugins/flappy/` deste repositório para `pitiupi/plugins/flappy/` e garanta a entrada correspondente no arquivo `plugins.registry.json` na raiz do Pitiupi:
+   ```json
+   {
+     "id": "flappy",
+     "category": "Jogos",
+     "dir": "plugins/flappy",
+     "jar": "plugins/flappy/dist/pitiupi.flappy.jar",
+     "runtimeName": "flappy.jar",
+     "mainClass": "pitiupi.flappy.plugin.FlappyPlugin"
+   }
+   ```
+
+3. Compile o plugin pela raiz do `pitiupi`:
+   ```bash
+   ./scripts/pitiupi.sh build --plugins flappy
+   ```
+   O pacote final será gerado em `plugins/flappy/dist/pitiupi.flappy.jar` e linkado em `.pitiupi/plugins/flappy.jar`.
+
+---
+
+## Execução em Rede Local (Linux e Windows)
+
+### No Linux
 ```bash
-./scripts/pitiupi.sh run --all
-# Ou apenas com o plugin flappy:
 ./scripts/pitiupi.sh run --plugins flappy
 ```
 
+### No Windows
+Copie o `pitiupi.flappy.jar` compilado para `.pitiupi/plugins/` e inicie o Pitiupi forçando a pilha IPv4 para o socket Multicast funcionar corretamente no Windows:
+```powershell
+java "-Djava.net.preferIPv4Stack=true" -jar pitiupi.jar
+```
+
+> **Dica de rede local:** Certifique-se de que ambos os PCs estão na mesma rede física/Wi-Fi, usando a mesma porta configurada no login do Pitiupi (ex.: `5000`), com a interface correta selecionada em **Configurações > Saída de rede** e o Firewall do Windows permitindo Java em rede privada. Se o roteador bloquear Multicast na aba `Todos ↑`, clique em `+ Nova` em ambos os PCs e informe o IPv4 local do colega para jogar por **UDP Unicast**.
